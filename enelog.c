@@ -2,6 +2,7 @@
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -22,63 +23,32 @@ usage(void)
         );
 }
 
-// get PERF_TYPE_POWER
-static unsigned int
-get_perf_type(void)
-{
-        FILE *fp;
-        char buf_type[256];
-
-        fp = fopen("/sys/bus/event_source/devices/power/type", "r");
-        if (fp == NULL) {
-                perror("failed to open /sys/bus/event_source/devices/power/type");
-                exit(EXIT_FAILURE);
-        }
-        if (fgets(buf_type, sizeof(buf_type), fp) == NULL) {
-                perror("failed to read power type");
-                fclose(fp);
-                exit(EXIT_FAILURE);
-        }
-        fclose(fp);
-
-        unsigned int type;
-
-        type = (unsigned int)strtoul(buf_type, NULL, 10);
-        return type;
-}
-
 static int
-open_perf_event_power(pid_t pid, int cpu, int group_fd, unsigned long flags)
+open_powercap(void)
 {
-        struct perf_event_attr  pea;
+        int     fd;
 
-        memset(&pea, 0, sizeof(struct perf_event_attr));
-        pea.type = get_perf_type();
-        pea.size = sizeof(struct perf_event_attr);
-        pea.config = 0x02;
-        pea.disabled = 0;
-        pea.exclude_kernel = 0;
-        pea.exclude_hv = 0;
-        pea.read_format = 0x1; // PERF_FORMAT_TOTAL_TIME_ENABLED
-
-        int fd = (int)syscall(__NR_perf_event_open, &pea, pid, cpu, group_fd, flags);
-        if (fd == -1) {
-                perror("perf_event_open");
+        fd = open("/sys/class/powercap/intel-rapl:0/energy_uj", O_RDONLY);
+        if (fd < 0) {
+                perror("failed to open /sys/class/powercap/intel-rapl:0/energy_uj");
                 exit(EXIT_FAILURE);
         }
         return fd;
 }
 
-static uint64_t
-read_counter(int fd)
+static double
+read_energy(int fd)
 {
-        uint64_t        count = 0;
+        unsigned long energy_uj;
+        char buf[128];
 
-        if (read(fd, &count, sizeof(count)) == -1) {
-                perror("read");
+        lseek(fd, 0, SEEK_SET);
+        if (read(fd, buf, sizeof(buf)) == -1) {
+                perror("failed to read");
                 exit(EXIT_FAILURE);
         }
-        return count;
+        energy_uj = strtoul(buf, NULL, 10);
+        return (double)energy_uj / 1e6;
 }
 
 static inline uint64_t
@@ -112,18 +82,20 @@ log_energy(int fd)
         double  energy_last;
 
         clock_gettime(CLOCK_MONOTONIC, &ts_last);
-        energy_last = read_counter(fd) / 1e6;
+        energy_last = read_energy(fd);
+
         while (1) {
                 struct timespec ts_cur;
 
                 clock_gettime(CLOCK_MONOTONIC, &ts_cur);
                 uint64_t        elapsed = get_usec_elapsed(&ts_last, &ts_cur);
                 if (elapsed >= interval) { // Convert seconds to microseconds
-                        double  energy_cur = read_counter(fd) / 1e6;
+                        double  energy_cur = read_energy(fd);
                         double  energy = energy_cur - energy_last;
                         double  power = energy / (elapsed / 1000000);
                         setup_current_time_str(timebuf);
                         printf("%s %.3f %.3f\n", timebuf, power, energy);
+                        fflush(stdout);
                         energy_last = energy_cur;
                         ts_last = ts_cur;
                         elapsed -= interval;
@@ -159,7 +131,7 @@ main(int argc, char *argv[])
 
         parse_args(argc, argv);
 
-        fd = open_perf_event_power(-1, 0, -1, 0);
+        fd = open_powercap();
 
         log_energy(fd);
 
