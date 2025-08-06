@@ -17,10 +17,11 @@ static void
 usage(void)
 {
         printf(
-"Usage: enelog [-i interval] [-h]\n"
-"Options:\n"
-"  -i interval   Set the interval for energy measurement (default: 1 second)\n"
-"  -h            Show this help message\n"
+                "Usage: enelog [-i interval] [-t timeout] [-h]\n"
+                "Options:\n"
+                "  -i <interval>  Sampling interval in seconds (default: 1 second)\n"
+                "  -t <timeout>   Total measurement duration in seconds (default: 120 seconds)\n"
+                "  -h             Show this help message and exit\n"
         );
 }
 

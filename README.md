@@ -24,8 +24,10 @@ After building, the executable will be available at `build/enelog`.
 ## Usage
 
 ```bash
-./enelog
+./enelog [-i <interval>] [-t <timeout>] [-h]
 ```
+- `-i <interval>`: Interval in seconds between power measurements (default: 1 second)
+- `-t <timeout>`: Timeout in seconds after which the program exits (default: 10 seconds)
 
 This command runs the program, which reports the CPU's power consumption using RAPL.
 
