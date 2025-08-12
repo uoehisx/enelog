@@ -9,9 +9,13 @@
 #include <stdlib.h>
 #include <time.h>
 #include <getopt.h>
+//NVML
+#include <nvml.h>
 
 static unsigned long     interval = 1000000; // Default interval in usecs
 static unsigned timeout = 120; // Default timeout in seconds
+static int      use_gpu = 0; // Default GPU power measurement disabled
+static nvmlDevice_t     *gpu_handle = NULL; // Handle for up to 2 GPUs
 
 static void
 usage(void)
@@ -22,6 +26,7 @@ usage(void)
                 "  -i <interval>  Sampling interval in seconds (default: 1 second)\n"
                 "  -t <timeout>   Total measurement duration in seconds (default: 120 seconds)\n"
                 "  -h             Show this help message and exit\n"
+                "  -g             Enable GPU power measurement\n"
         );
 }
 
@@ -88,10 +93,78 @@ wait_until_aligned_interval(void)
         unsigned wait_sec = (sec % intv == 0) ? 0 : intv - (sec % intv);
         long wait_usec = (1000000000L - nsec) / 1000;
 
-        // 전체 대기 시간 (마이크로초)
+        // total wait time(microsecond)
         long total_wait = wait_sec * 1000000L + wait_usec;
         if (total_wait > 0)
                 usleep(total_wait);
+}
+
+/*GPU power measurement*/
+unsigned int    gpu_count = 0;
+
+void 
+init_nvml(void)
+{
+        if (nvmlInit_v2() != NVML_SUCCESS) {
+                fprintf(stderr, "NVML init failed\n");
+                exit(EXIT_FAILURE);
+        }
+        if (nvmlDeviceGetCount_v2(&gpu_count) != NVML_SUCCESS || gpu_count == 0) {
+                fprintf(stderr, "No NVIDIA GPUs found\n");
+                exit(EXIT_FAILURE);
+        }
+        if (gpu_count == 0) {
+                return;
+        }
+
+        gpu_handle = (nvmlDevice_t *)malloc(sizeof(nvmlDevice_t) * gpu_count);
+        if (!gpu_handle) {
+                perror("malloc for gpu_handle");
+                exit(EXIT_FAILURE);
+        }
+
+        for (unsigned int i = 0; i < gpu_count; i++)
+                if (nvmlDeviceGetHandleByIndex_v2(i, &gpu_handle[i]) != NVML_SUCCESS) {
+                        fprintf(stderr, "Failed to get handle for GPU %d\n", i);
+                        exit(EXIT_FAILURE);
+                }
+}
+
+void shutdown_nvml(void)
+{
+        if (gpu_handle) {
+                free(gpu_handle);
+                gpu_handle = NULL;
+        }
+        nvmlShutdown();
+}
+
+static double 
+read_gpu_power(double *p0, double *p1)
+{       
+        if (gpu_count == 0 || gpu_handle == NULL) {
+                *p0 = 0.00;
+                *p1 = 0.00;
+                return 0.0;
+        }
+
+        unsigned int    n=(gpu_count<2)?gpu_count:2;
+        double          power_w[2]={0.00,0.00};
+
+        // Read power usage for each GPU
+        for (unsigned int i=0;i<n;i++){
+                unsigned int    mw=0;
+                if(nvmlDeviceGetPowerUsage(gpu_handle[i], &mw) == NVML_SUCCESS){
+                        power_w[i] = mw / 1000.00;
+                }else{
+                        power_w[i] = 0.00;
+                }
+        }
+
+        *p0 = power_w[0];
+        *p1 = (n >= 2) ? power_w[1] : 0.00;
+        // Return both individual and average power
+        return (n == 0) ? 0.0 : (n == 1) ? power_w[0] : (power_w[0] + power_w[1]) / 2.0;
 }
 
 static void
@@ -119,8 +192,21 @@ log_energy(int fd)
                         double  energy_cur = read_energy(fd);
                         double  energy = energy_cur - energy_last;
                         double  power = energy / (elapsed / 1000000);
+
+                if (use_gpu) {
+                        double g0, g1;
+                        double gpu_avg = read_gpu_power(&g0, &g1);
+                        double gpu_energy = gpu_avg * (elapsed / 1000000);
+
+                        setup_current_time_str(timebuf);
+                        printf("%s %.3f %.3f %.3f %.3f %.3f %.3f \n",
+                                timebuf, power, energy, g0, g1, gpu_avg, gpu_energy);
+                }
+                else {
                         setup_current_time_str(timebuf);
                         printf("%s %.3f %.3f\n", timebuf, power, energy);
+                }
+
                         fflush(stdout);
                         energy_last = energy_cur;
                         ts_last = ts_cur;
@@ -133,9 +219,9 @@ log_energy(int fd)
 static void
 parse_args(int argc, char *argv[])
 {
-        int     c, opt;
+        int     c;
 
-        while ((c = getopt(argc, argv, "i:t:h")) != -1) {
+        while ((c = getopt(argc, argv, "i:t:hg")) != -1) {
                 switch (c) {
                         case 'i':
                                 interval = strtoul(optarg, NULL, 10) * 1000000;
@@ -150,6 +236,9 @@ parse_args(int argc, char *argv[])
                         case 'h':
                                 usage();
                                 exit(0);
+                        case 'g':
+                                use_gpu = 1;
+                                break;
                         default:
                                 usage();
                                 exit(EXIT_FAILURE);
@@ -157,17 +246,25 @@ parse_args(int argc, char *argv[])
         }
 }
 
+
 int
 main(int argc, char *argv[])
-{
+{       
         int     fd;
 
         parse_args(argc, argv);
 
+        if (use_gpu) {
+                init_nvml();    
+        }
+
         fd = open_powercap();
-
         log_energy(fd);
-
         close(fd);
+
+        if (use_gpu) {
+                shutdown_nvml();
+        }
+
         return 0;
 }
