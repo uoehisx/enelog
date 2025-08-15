@@ -18,7 +18,9 @@ static unsigned long     interval = 1000000; // Default interval in usecs
 static unsigned timeout = 120; // Default timeout in seconds
 #ifndef NO_NVML
 static int      use_gpu = 0; // Default GPU power measurement disabled
-static nvmlDevice_t     *gpu_handle = NULL; // Handle for up to 2 GPUs
+static int      gpu_count;
+static nvmlDevice_t     *gpu_handle; // Handle for up to 2 GPUs
+static double   *gpu_powers, *gpu_powers_last, *gpu_energies;
 #endif
 
 static void
@@ -50,7 +52,7 @@ open_powercap(void)
 }
 
 static double
-read_energy(int fd)
+read_energy_cpu(int fd)
 {
         unsigned long energy_uj;
         char buf[128];
@@ -106,10 +108,8 @@ wait_until_aligned_interval(void)
 }
 
 #ifndef NO_NVML
-/*GPU power measurement*/
-unsigned int    gpu_count = 0;
 
-static void 
+static void
 init_nvml(void)
 {
         if (nvmlInit_v2() != NVML_SUCCESS) {
@@ -125,12 +125,22 @@ init_nvml(void)
                 perror("malloc for gpu_handle");
                 exit(EXIT_FAILURE);
         }
-
+        gpu_powers = (double *)malloc(sizeof(double) * gpu_count * 2);
+        if (!gpu_powers) {
+                perror("malloc for gpu_powers");
+                exit(EXIT_FAILURE);
+        }
+        gpu_energies = (double *)malloc(sizeof(double) * gpu_count);
+        if (!gpu_energies) {
+                perror("malloc for gpu_energies");
+                exit(EXIT_FAILURE);
+        }
         for (unsigned int i = 0; i < gpu_count; i++) {
                 if (nvmlDeviceGetHandleByIndex_v2(i, &gpu_handle[i]) != NVML_SUCCESS) {
                         fprintf(stderr, "Failed to get handle for GPU %d\n", i);
                         exit(EXIT_FAILURE);
                 }
+                gpu_energies[i] = 0.0;
         }
 }
 
@@ -144,37 +154,36 @@ shutdown_nvml(void)
         nvmlShutdown();
 }
 
-static void
-read_gpu_power(double *powers, double *out_sum, double *out_avg)
-{
-        if (!powers && (out_sum || out_avg)) {
-                double  sum = 0.0;
-                for (unsigned int i = 0; i < gpu_count; i++) {
-                        unsigned int    mw = 0;
-                        if (nvmlDeviceGetPowerUsage(gpu_handle[i], &mw) == NVML_SUCCESS)
-                                sum += mw / 1000.0;
-                }
-                if (out_sum)
-                        *out_sum = sum;
-                if (out_avg)
-                        *out_avg = (gpu_count ? (sum / gpu_count) : 0.0);
-                return;
-        }
+#define GET_GPU_POWERS_CUR() \
+        (gpu_powers_last == NULL || gpu_powers_last != gpu_powers) ? (gpu_powers): (gpu_powers + gpu_count)
 
-        double  sum = 0.0;
+static void
+read_energy_gpu(void)
+{
+        double  *gpu_powers_cur = GET_GPU_POWERS_CUR();
+
         for (unsigned int i = 0; i < gpu_count; i++) {
-                unsigned int    mw = 0;
-                double          w  = 0.0;
-                if (nvmlDeviceGetPowerUsage(gpu_handle[i], &mw) == NVML_SUCCESS)
-                        w = mw / 1000.0;
-                powers[i] = w;
-                sum += w;
+                unsigned int    milli_watt;
+                if (nvmlDeviceGetPowerUsage(gpu_handle[i], &milli_watt) == NVML_SUCCESS)
+                        gpu_powers_cur[i] = milli_watt / 1000.0;
+                if (gpu_powers_last != NULL)
+                        gpu_energies[i] = (gpu_powers_last[i] + gpu_powers_cur[i]) * interval / 1000000.0 / 2;
         }
-        if (out_sum)
-                *out_sum = sum;
-        if (out_avg)
-                *out_avg = (gpu_count ? (sum / gpu_count) : 0.0);
 }
+
+static void
+get_total_power_energy_gpu(double *p_total_power, double *p_total_energy)
+{
+        double  *gpu_powers_cur = GET_GPU_POWERS_CUR();
+
+        *p_total_power = 0;
+        *p_total_energy = 0;
+        for (unsigned int i = 0; i < gpu_count; i++) {
+                (*p_total_power) += gpu_powers_cur[i];
+                (*p_total_energy) += gpu_energies[i];
+        }
+}
+
 #endif
 
 static void
@@ -183,23 +192,14 @@ log_energy(int fd)
         char    timebuf[32];
         struct timespec ts_start, ts_next;
         double  energy_last;
-#ifndef NO_NVML
-        double  *gpu_powers = NULL;
-
-        if (use_gpu) {
-                gpu_powers = (double *)malloc(sizeof(double) * gpu_count);
-                if (!gpu_powers) {
-                        perror("malloc for gpu_powers");
-                        exit(EXIT_FAILURE);
-                }
-        }
-#endif
 
         wait_until_aligned_interval();
 
         clock_gettime(CLOCK_MONOTONIC, &ts_start);
         ts_next = ts_start;
-        energy_last = read_energy(fd);
+        energy_last = read_energy_cpu(fd);
+        read_energy_gpu();
+        gpu_powers_last = gpu_powers;
 
         while (1) {
                 uint64_t        elapsed_from_start = get_usec_elapsed(&ts_start, &ts_next);
@@ -214,7 +214,7 @@ log_energy(int fd)
                 }
                 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts_next, NULL);
 
-                double  energy_cur = read_energy(fd);
+                double  energy_cur = read_energy_cpu(fd);
                 double  energy = energy_cur - energy_last;
                 double  power = energy / (interval / 1000000);
                 setup_current_time_str(timebuf);
@@ -222,29 +222,23 @@ log_energy(int fd)
                 printf("%s %.3f %.3f", timebuf, power, energy);
 #ifndef NO_NVML
                 if (use_gpu) {
-                        double  gpu_sum = 0.0;
-                        double  gpu_avg = 0.0;
+                        double  total_power, total_energy;
 
-                        read_gpu_power(gpu_powers, &gpu_sum, &gpu_avg);
+                        read_energy_gpu();
+                        get_total_power_energy_gpu(&total_power, &total_energy);
+                        printf(" %.3f %.3f", total_power, total_energy);
 
+                        double  *gpu_powers_cur = GET_GPU_POWERS_CUR();
                         for (unsigned int i = 0; i < gpu_count; i++) {
-                                printf(" %.3f", gpu_powers[i]);
+                                printf(" %.3f %.3f", gpu_powers_cur[i], gpu_energies[i]);
                         }
-
-                        double  dt_sec          = interval / 1000000.0;
-                        double  gpu_energy      = gpu_sum * dt_sec;
-                        printf(" %.3f %.3f %.3f", gpu_avg, gpu_sum, gpu_energy);
+                        gpu_powers_last = gpu_powers_cur;
                 }
 #endif
                 printf("\n");
                 fflush(stdout);
                 energy_last = energy_cur;
         }
-#ifndef NO_NVML
-        if (gpu_powers) {
-                free(gpu_powers);
-        }
-#endif
 }
 
 static void
