@@ -185,15 +185,7 @@ log_energy(int fd)
         double  energy_last;
 #ifndef NO_NVML
         double  *gpu_powers = NULL;
-#endif
 
-        wait_until_aligned_interval();
-
-        clock_gettime(CLOCK_MONOTONIC, &ts_start);
-        ts_last = ts_start;
-        energy_last = read_energy(fd);
-
-#ifndef NO_NVML
         if (use_gpu) {
                 gpu_powers = (double *)malloc(sizeof(double) * gpu_count);
                 if (!gpu_powers) {
@@ -202,6 +194,12 @@ log_energy(int fd)
                 }
         }
 #endif
+
+        wait_until_aligned_interval();
+
+        clock_gettime(CLOCK_MONOTONIC, &ts_start);
+        ts_last = ts_start;
+        energy_last = read_energy(fd);
 
         while (1) {
                 struct timespec ts_cur;
@@ -218,6 +216,7 @@ log_energy(int fd)
 
                         setup_current_time_str(timebuf);
 
+                        printf("%s %.3f %.3f", timebuf, power, energy);
 #ifndef NO_NVML
                         if (use_gpu) {
                                 double  gpu_sum = 0.0;
@@ -225,22 +224,16 @@ log_energy(int fd)
 
                                 read_gpu_power(gpu_powers, &gpu_sum, &gpu_avg);
 
-                                printf("%s %.3f %.3f", timebuf, power, energy);
-
                                 for (unsigned int i = 0; i < gpu_count; i++) {
                                         printf(" %.3f", gpu_powers[i]);
                                 }
 
                                 double  dt_sec          = elapsed / 1000000.0;
                                 double  gpu_energy      = gpu_sum * dt_sec;
-                                printf(" %.3f %.3f %.3f\n", gpu_avg, gpu_sum, gpu_energy);
-                        } 
-                        else {
-                                printf("%s %.3f %.3f\n", timebuf, power, energy);
+                                printf(" %.3f %.3f %.3f", gpu_avg, gpu_sum, gpu_energy);
                         }
-#else
-                        printf("%s %.3f %.3f\n", timebuf, power, energy);
 #endif
+                        printf("\n");
                         fflush(stdout);
                         energy_last = energy_cur;
                         ts_last = ts_cur;
