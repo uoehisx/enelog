@@ -9,13 +9,17 @@
 #include <stdlib.h>
 #include <time.h>
 #include <getopt.h>
-//NVML
+
+#ifndef NO_NVML
 #include <nvml.h>
+#endif
 
 static unsigned long     interval = 1000000; // Default interval in usecs
 static unsigned timeout = 120; // Default timeout in seconds
+#ifndef NO_NVML
 static int      use_gpu = 0; // Default GPU power measurement disabled
 static nvmlDevice_t     *gpu_handle = NULL; // Handle for up to 2 GPUs
+#endif
 
 static void
 usage(void)
@@ -26,7 +30,9 @@ usage(void)
                 "  -i <interval>  Sampling interval in seconds (default: 1 second)\n"
                 "  -t <timeout>   Total measurement duration in seconds (default: 120 seconds)\n"
                 "  -h             Show this help message and exit\n"
+#ifndef NO_NVML
                 "  -g             Enable GPU power measurement\n"
+#endif
         );
 }
 
@@ -99,6 +105,7 @@ wait_until_aligned_interval(void)
                 usleep(total_wait);
 }
 
+#ifndef NO_NVML
 /*GPU power measurement*/
 unsigned int    gpu_count = 0;
 
@@ -168,6 +175,7 @@ read_gpu_power(double *powers, double *out_sum, double *out_avg)
         if (out_avg)
                 *out_avg = (gpu_count ? (sum / gpu_count) : 0.0);
 }
+#endif
 
 static void
 log_energy(int fd)
@@ -175,7 +183,9 @@ log_energy(int fd)
         char    timebuf[32];
         struct timespec ts_start, ts_last;
         double  energy_last;
+#ifndef NO_NVML
         double  *gpu_powers = NULL;
+#endif
 
         wait_until_aligned_interval();
 
@@ -183,6 +193,7 @@ log_energy(int fd)
         ts_last = ts_start;
         energy_last = read_energy(fd);
 
+#ifndef NO_NVML
         if (use_gpu) {
                 gpu_powers = (double *)malloc(sizeof(double) * gpu_count);
                 if (!gpu_powers) {
@@ -190,6 +201,7 @@ log_energy(int fd)
                         exit(EXIT_FAILURE);
                 }
         }
+#endif
 
         while (1) {
                 struct timespec ts_cur;
@@ -206,6 +218,7 @@ log_energy(int fd)
 
                         setup_current_time_str(timebuf);
 
+#ifndef NO_NVML
                         if (use_gpu) {
                                 double  gpu_sum = 0.0;
                                 double  gpu_avg = 0.0;
@@ -225,7 +238,9 @@ log_energy(int fd)
                         else {
                                 printf("%s %.3f %.3f\n", timebuf, power, energy);
                         }
-
+#else
+                        printf("%s %.3f %.3f\n", timebuf, power, energy);
+#endif
                         fflush(stdout);
                         energy_last = energy_cur;
                         ts_last = ts_cur;
@@ -240,9 +255,11 @@ log_energy(int fd)
                 }
 
         }
+#ifndef NO_NVML
         if (gpu_powers) {
                 free(gpu_powers);
         }
+#endif
 }
 
 static void
@@ -266,8 +283,10 @@ parse_args(int argc, char *argv[])
                                 usage();
                                 exit(0);
                         case 'g':
+#ifndef NO_NVML
                                 use_gpu = 1;
                                 break;
+#endif
                         default:
                                 usage();
                                 exit(EXIT_FAILURE);
@@ -283,17 +302,21 @@ main(int argc, char *argv[])
 
         parse_args(argc, argv);
 
+#ifndef NO_NVML
         if (use_gpu) {
                 init_nvml();    
         }
+#endif
 
         fd = open_powercap();
         log_energy(fd);
         close(fd);
 
+#ifndef NO_NVML
         if (use_gpu) {
                 shutdown_nvml();
         }
+#endif
 
         return 0;
 }
