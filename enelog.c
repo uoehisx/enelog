@@ -102,7 +102,7 @@ wait_until_aligned_interval(void)
 /*GPU power measurement*/
 unsigned int    gpu_count = 0;
 
-void 
+static void 
 init_nvml(void)
 {
         if (nvmlInit_v2() != NVML_SUCCESS) {
@@ -113,24 +113,22 @@ init_nvml(void)
                 fprintf(stderr, "No NVIDIA GPUs found\n");
                 exit(EXIT_FAILURE);
         }
-        if (gpu_count == 0) {
-                return;
-        }
-
         gpu_handle = (nvmlDevice_t *)malloc(sizeof(nvmlDevice_t) * gpu_count);
         if (!gpu_handle) {
                 perror("malloc for gpu_handle");
                 exit(EXIT_FAILURE);
         }
 
-        for (unsigned int i = 0; i < gpu_count; i++)
+        for (unsigned int i = 0; i < gpu_count; i++) {
                 if (nvmlDeviceGetHandleByIndex_v2(i, &gpu_handle[i]) != NVML_SUCCESS) {
                         fprintf(stderr, "Failed to get handle for GPU %d\n", i);
                         exit(EXIT_FAILURE);
                 }
+        }
 }
 
-void shutdown_nvml(void)
+static void 
+shutdown_nvml(void)
 {
         if (gpu_handle) {
                 free(gpu_handle);
@@ -139,32 +137,36 @@ void shutdown_nvml(void)
         nvmlShutdown();
 }
 
-static double 
-read_gpu_power(double *p0, double *p1)
-{       
-        if (gpu_count == 0 || gpu_handle == NULL) {
-                *p0 = 0.00;
-                *p1 = 0.00;
-                return 0.0;
-        }
-
-        unsigned int    n=(gpu_count<2)?gpu_count:2;
-        double          power_w[2]={0.00,0.00};
-
-        // Read power usage for each GPU
-        for (unsigned int i=0;i<n;i++){
-                unsigned int    mw=0;
-                if(nvmlDeviceGetPowerUsage(gpu_handle[i], &mw) == NVML_SUCCESS){
-                        power_w[i] = mw / 1000.00;
-                }else{
-                        power_w[i] = 0.00;
+static void
+read_gpu_power(double *powers, double *out_sum, double *out_avg)
+{
+        if (!powers && (out_sum || out_avg)) {
+                double  sum = 0.0;
+                for (unsigned int i = 0; i < gpu_count; i++) {
+                        unsigned int    mw = 0;
+                        if (nvmlDeviceGetPowerUsage(gpu_handle[i], &mw) == NVML_SUCCESS)
+                                sum += mw / 1000.0;
                 }
+                if (out_sum)
+                        *out_sum = sum;
+                if (out_avg)
+                        *out_avg = (gpu_count ? (sum / gpu_count) : 0.0);
+                return;
         }
 
-        *p0 = power_w[0];
-        *p1 = (n >= 2) ? power_w[1] : 0.00;
-        // Return both individual and average power
-        return (n == 0) ? 0.0 : (n == 1) ? power_w[0] : (power_w[0] + power_w[1]) / 2.0;
+        double  sum = 0.0;
+        for (unsigned int i = 0; i < gpu_count; i++) {
+                unsigned int    mw = 0;
+                double          w  = 0.0;
+                if (nvmlDeviceGetPowerUsage(gpu_handle[i], &mw) == NVML_SUCCESS)
+                        w = mw / 1000.0;
+                powers[i] = w;
+                sum += w;
+        }
+        if (out_sum)
+                *out_sum = sum;
+        if (out_avg)
+                *out_avg = (gpu_count ? (sum / gpu_count) : 0.0);
 }
 
 static void
@@ -173,12 +175,21 @@ log_energy(int fd)
         char    timebuf[32];
         struct timespec ts_start, ts_last;
         double  energy_last;
+        double  *gpu_powers = NULL;
 
         wait_until_aligned_interval();
 
         clock_gettime(CLOCK_MONOTONIC, &ts_start);
         ts_last = ts_start;
         energy_last = read_energy(fd);
+
+        if (use_gpu) {
+                gpu_powers = (double *)malloc(sizeof(double) * gpu_count);
+                if (!gpu_powers) {
+                        perror("malloc for gpu_powers");
+                        exit(EXIT_FAILURE);
+                }
+        }
 
         while (1) {
                 struct timespec ts_cur;
@@ -193,26 +204,44 @@ log_energy(int fd)
                         double  energy = energy_cur - energy_last;
                         double  power = energy / (elapsed / 1000000);
 
-                if (use_gpu) {
-                        double g0, g1;
-                        double gpu_avg = read_gpu_power(&g0, &g1);
-                        double gpu_energy = gpu_avg * (elapsed / 1000000);
+                        setup_current_time_str(timebuf);
 
-                        setup_current_time_str(timebuf);
-                        printf("%s %.3f %.3f %.3f %.3f %.3f %.3f \n",
-                                timebuf, power, energy, g0, g1, gpu_avg, gpu_energy);
-                }
-                else {
-                        setup_current_time_str(timebuf);
-                        printf("%s %.3f %.3f\n", timebuf, power, energy);
-                }
+                        if (use_gpu) {
+                                double  gpu_sum = 0.0;
+                                double  gpu_avg = 0.0;
+
+                                read_gpu_power(gpu_powers, &gpu_sum, &gpu_avg);
+
+                                printf("%s %.3f %.3f", timebuf, power, energy);
+
+                                for (unsigned int i = 0; i < gpu_count; i++) {
+                                        printf(" %.3f", gpu_powers[i]);
+                                }
+
+                                double  dt_sec          = elapsed / 1000000.0;
+                                double  gpu_energy      = gpu_sum * dt_sec;
+                                printf(" %.3f %.3f %.3f\n", gpu_avg, gpu_sum, gpu_energy);
+                        } 
+                        else {
+                                printf("%s %.3f %.3f\n", timebuf, power, energy);
+                        }
 
                         fflush(stdout);
                         energy_last = energy_cur;
                         ts_last = ts_cur;
-                        elapsed -= interval;
                 }
-                usleep(interval - elapsed);
+                {
+                        struct  timespec ts_now;
+                        clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                        uint64_t since_last = get_usec_elapsed(&ts_last, &ts_now);
+                        if (since_last < interval) {
+                                usleep(interval - since_last);
+                        }
+                }
+
+        }
+        if (gpu_powers) {
+                free(gpu_powers);
         }
 }
 
