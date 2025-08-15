@@ -181,7 +181,7 @@ static void
 log_energy(int fd)
 {
         char    timebuf[32];
-        struct timespec ts_start, ts_last;
+        struct timespec ts_start, ts_next;
         double  energy_last;
 #ifndef NO_NVML
         double  *gpu_powers = NULL;
@@ -198,55 +198,47 @@ log_energy(int fd)
         wait_until_aligned_interval();
 
         clock_gettime(CLOCK_MONOTONIC, &ts_start);
-        ts_last = ts_start;
+        ts_next = ts_start;
         energy_last = read_energy(fd);
 
         while (1) {
-                struct timespec ts_cur;
-
-                clock_gettime(CLOCK_MONOTONIC, &ts_cur);
-                uint64_t        elapsed_from_start = get_usec_elapsed(&ts_start, &ts_cur);
+                uint64_t        elapsed_from_start = get_usec_elapsed(&ts_start, &ts_next);
                 if (elapsed_from_start >= timeout * 1000000)
                         break;
-                uint64_t        elapsed = get_usec_elapsed(&ts_last, &ts_cur);
-                if (elapsed >= interval) { // Convert seconds to microseconds
-                        double  energy_cur = read_energy(fd);
-                        double  energy = energy_cur - energy_last;
-                        double  power = energy / (elapsed / 1000000);
 
-                        setup_current_time_str(timebuf);
+                ts_next.tv_sec += interval / 1000000;
+                ts_next.tv_nsec += (interval % 1000000) * 1000;
+                if (ts_next.tv_nsec >= 1000000000) {
+                        ts_next.tv_sec += 1;
+                        ts_next.tv_nsec -= 1000000000;
+                }
+                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts_next, NULL);
 
-                        printf("%s %.3f %.3f", timebuf, power, energy);
+                double  energy_cur = read_energy(fd);
+                double  energy = energy_cur - energy_last;
+                double  power = energy / (interval / 1000000);
+                setup_current_time_str(timebuf);
+
+                printf("%s %.3f %.3f", timebuf, power, energy);
 #ifndef NO_NVML
-                        if (use_gpu) {
-                                double  gpu_sum = 0.0;
-                                double  gpu_avg = 0.0;
+                if (use_gpu) {
+                        double  gpu_sum = 0.0;
+                        double  gpu_avg = 0.0;
 
-                                read_gpu_power(gpu_powers, &gpu_sum, &gpu_avg);
+                        read_gpu_power(gpu_powers, &gpu_sum, &gpu_avg);
 
-                                for (unsigned int i = 0; i < gpu_count; i++) {
-                                        printf(" %.3f", gpu_powers[i]);
-                                }
-
-                                double  dt_sec          = elapsed / 1000000.0;
-                                double  gpu_energy      = gpu_sum * dt_sec;
-                                printf(" %.3f %.3f %.3f", gpu_avg, gpu_sum, gpu_energy);
+                        for (unsigned int i = 0; i < gpu_count; i++) {
+                                printf(" %.3f", gpu_powers[i]);
                         }
+
+                        double  dt_sec          = interval / 1000000.0;
+                        double  gpu_energy      = gpu_sum * dt_sec;
+                        printf(" %.3f %.3f %.3f", gpu_avg, gpu_sum, gpu_energy);
+                }
 #endif
-                        printf("\n");
-                        fflush(stdout);
-                        energy_last = energy_cur;
-                        ts_last = ts_cur;
-                }
-                {
-                        struct  timespec ts_now;
-                        clock_gettime(CLOCK_MONOTONIC, &ts_now);
-                        uint64_t since_last = get_usec_elapsed(&ts_last, &ts_now);
-                        if (since_last < interval) {
-                                usleep(interval - since_last);
-                        }
-                }
-
+                printf("\n");
+                fflush(stdout);
+                energy_last = energy_cur;
         }
 #ifndef NO_NVML
         if (gpu_powers) {
@@ -286,7 +278,6 @@ parse_args(int argc, char *argv[])
                 }
         }
 }
-
 
 int
 main(int argc, char *argv[])
