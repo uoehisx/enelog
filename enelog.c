@@ -16,9 +16,11 @@
 
 static unsigned long     interval = 1000000; // Default interval in usecs
 static unsigned timeout = 120; // Default timeout in seconds
+static int      has_mmdd = 0;
+static int      has_energy = 0;
 static int      has_headers = 0;
 #ifndef NO_NVML
-static int      use_gpu = 0; // Default GPU power measurement disabled
+static int      use_gpu = 0, per_gpu_output = 0;
 static int      gpu_count;
 static nvmlDevice_t     *gpu_handle; // Handle for up to 2 GPUs
 static double   *gpu_powers, *gpu_powers_last, *gpu_energies;
@@ -32,10 +34,13 @@ usage(void)
                 "Options:\n"
                 "  -i <interval>  Sampling interval in seconds (default: 1 second)\n"
                 "  -t <timeout>   Total measurement duration in seconds (default: 120 seconds)\n"
+                "  -D             Show MM-dd field in outputs\n"
+                "  -E             Show energy field in outputs\n"
                 "  -H             Show field headers in outputs\n"
                 "  -h             Show this help message and exit\n"
 #ifndef NO_NVML
                 "  -g             Enable GPU power measurement\n"
+                "  -G             Show all powers of GPU devices\n"
 #endif
         );
 }
@@ -88,7 +93,10 @@ setup_current_time_str(char *timebuf)
         struct tm       tm_now;
         localtime_r(&now, &tm_now);
 
-        strftime(timebuf, 32, "%m-%d %H:%M:%S", &tm_now);
+        if (has_mmdd)
+                strftime(timebuf, 32, "%m-%d %H:%M:%S", &tm_now);
+        else
+                strftime(timebuf, 32, "%H:%M:%S", &tm_now);
 }
 
 static void
@@ -193,12 +201,24 @@ print_headers(void)
 {
         if (!has_headers)
                 return;
-        printf("# MM-dd HH:mm:ss CPU(W) CPU(J)");
+        printf("#");
+        if (has_mmdd)
+                printf(" mm-dd");
+        printf(" HH:MM:ss CPU(W)");
+        if (has_energy)
+                printf(" CPU(J)");
 #ifndef NO_NVML
         if (use_gpu) {
-                printf(" GPU(W) GPU(J)");
-                for (int i = 0; i < gpu_count; i++)
-                        printf(" GPU%02d(W) GPU%02d(J)", i, i);
+                printf(" GPU(W)");
+                if (has_energy)
+                        printf(" GPU(J)");
+                if (per_gpu_output) {
+                        for (int i = 0; i < gpu_count; i++) {
+                                printf(" GPU%02d(W)", i);
+                                if (has_energy)
+                                        printf(" GPU%02d(J)", i);
+                        }
+                }
         }
 #endif
         printf("\n");
@@ -239,18 +259,27 @@ log_energy(int fd)
                 double  power = energy / (interval / 1000000);
                 setup_current_time_str(timebuf);
 
-                printf("%s %.3f %.3f", timebuf, power, energy);
+                printf("%s %.3f", timebuf, power);
+                if (has_energy)
+                        printf(" %.3f", energy);
 #ifndef NO_NVML
                 if (use_gpu) {
                         double  total_power, total_energy;
 
                         read_energy_gpu();
                         get_total_power_energy_gpu(&total_power, &total_energy);
-                        printf(" %.3f %.3f", total_power, total_energy);
+                        
+                        printf(" %.3f", total_power);
+                        if (has_energy)
+                                printf(" %.3f", total_energy);
 
                         double  *gpu_powers_cur = GET_GPU_POWERS_CUR();
-                        for (unsigned int i = 0; i < gpu_count; i++) {
-                                printf(" %.3f %.3f", gpu_powers_cur[i], gpu_energies[i]);
+                        if (per_gpu_output) {
+                                for (unsigned int i = 0; i < gpu_count; i++) {
+                                        printf(" %.3f", gpu_powers_cur[i]);
+                                        if (has_energy)
+                                                printf(" %.3f", gpu_energies[i]);
+                                }
                         }
                         gpu_powers_last = gpu_powers_cur;
                 }
@@ -266,7 +295,7 @@ parse_args(int argc, char *argv[])
 {
         int     c;
 
-        while ((c = getopt(argc, argv, "i:t:Hhg")) != -1) {
+        while ((c = getopt(argc, argv, "i:t:DEHhgG")) != -1) {
                 switch (c) {
                         case 'i':
                                 interval = strtoul(optarg, NULL, 10) * 1000000;
@@ -278,6 +307,12 @@ parse_args(int argc, char *argv[])
                                         exit(EXIT_FAILURE);
                                 }
                                 break;
+                        case 'D':
+                                has_mmdd = 1;
+                                break;
+                        case 'E':
+                                has_energy = 1;
+                                break;
                         case 'H':
                                 has_headers = 1;
                                 break;
@@ -287,6 +322,10 @@ parse_args(int argc, char *argv[])
                         case 'g':
 #ifndef NO_NVML
                                 use_gpu = 1;
+                                break;
+                        case 'G':
+                                use_gpu = 1;
+                                per_gpu_output = 1;
                                 break;
 #endif
                         default:
