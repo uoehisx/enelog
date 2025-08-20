@@ -16,6 +16,7 @@
 
 static unsigned long     interval = 1000000; // Default interval in usecs
 static unsigned timeout = 120; // Default timeout in seconds
+static int      has_headers = 0;
 #ifndef NO_NVML
 static int      use_gpu = 0; // Default GPU power measurement disabled
 static int      gpu_count;
@@ -31,6 +32,7 @@ usage(void)
                 "Options:\n"
                 "  -i <interval>  Sampling interval in seconds (default: 1 second)\n"
                 "  -t <timeout>   Total measurement duration in seconds (default: 120 seconds)\n"
+                "  -H             Show field headers in outputs\n"
                 "  -h             Show this help message and exit\n"
 #ifndef NO_NVML
                 "  -g             Enable GPU power measurement\n"
@@ -187,6 +189,22 @@ get_total_power_energy_gpu(double *p_total_power, double *p_total_energy)
 #endif
 
 static void
+print_headers(void)
+{
+        if (!has_headers)
+                return;
+        printf("# MM-dd HH:mm:ss CPU(W) CPU(J)");
+#ifndef NO_NVML
+        if (use_gpu) {
+                printf(" GPU(W) GPU(J)");
+                for (int i = 0; i < gpu_count; i++)
+                        printf(" GPU%02d(W) GPU%02d(J)", i, i);
+        }
+#endif
+        printf("\n");
+}
+
+static void
 log_energy(int fd)
 {
         char    timebuf[32];
@@ -194,6 +212,8 @@ log_energy(int fd)
         double  energy_last;
 
         wait_until_aligned_interval();
+
+        print_headers();
 
         clock_gettime(CLOCK_MONOTONIC, &ts_start);
         ts_next = ts_start;
@@ -246,7 +266,7 @@ parse_args(int argc, char *argv[])
 {
         int     c;
 
-        while ((c = getopt(argc, argv, "i:t:hg")) != -1) {
+        while ((c = getopt(argc, argv, "i:t:Hhg")) != -1) {
                 switch (c) {
                         case 'i':
                                 interval = strtoul(optarg, NULL, 10) * 1000000;
@@ -257,6 +277,9 @@ parse_args(int argc, char *argv[])
                                         fprintf(stderr, "Invalid timeout value: %s\n", optarg);
                                         exit(EXIT_FAILURE);
                                 }
+                                break;
+                        case 'H':
+                                has_headers = 1;
                                 break;
                         case 'h':
                                 usage();
