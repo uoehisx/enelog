@@ -238,9 +238,10 @@ log_energy(int fd)
         clock_gettime(CLOCK_MONOTONIC, &ts_start);
         ts_next = ts_start;
         energy_last = read_energy_cpu(fd);
+#ifndef NO_NVML
         read_energy_gpu();
         gpu_powers_last = gpu_powers;
-
+#endif
         while (1) {
                 uint64_t        elapsed_from_start = get_usec_elapsed(&ts_start, &ts_next);
                 if (elapsed_from_start >= timeout * 1000000)
