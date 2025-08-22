@@ -16,6 +16,7 @@
 
 static unsigned long     interval = 1000000; // Default interval in usecs
 static unsigned timeout = 120; // Default timeout in seconds
+static int      has_dram = 0;
 static int      has_mmdd = 0;
 static int      has_energy = 0;
 static int      has_headers = 0;
@@ -34,6 +35,7 @@ usage(void)
                 "Options:\n"
                 "  -i <interval>  Sampling interval in seconds (default: 1 second)\n"
                 "  -t <timeout>   Total measurement duration in seconds (default: 120 seconds)\n"
+                "  -d             Enable DRAM power measurement\n"
                 "  -D             Show MM-dd field in outputs\n"
                 "  -E             Show energy field in outputs\n"
                 "  -H             Show field headers in outputs\n"
@@ -46,20 +48,48 @@ usage(void)
 }
 
 static int
-open_powercap(void)
+open_powercap(const char *path)
 {
         int     fd;
 
-        fd = open("/sys/class/powercap/intel-rapl:0/energy_uj", O_RDONLY);
+        fd = open(path, O_RDONLY);
         if (fd < 0) {
-                perror("failed to open /sys/class/powercap/intel-rapl:0/energy_uj");
+                char    *errmsg;
+                asprintf(&errmsg, "failed to open %s", path);
+                perror(errmsg);
                 exit(EXIT_FAILURE);
         }
         return fd;
 }
 
+static int
+open_powercap_pkg0_energy(void)
+{
+        return open_powercap("/sys/class/powercap/intel-rapl:0/energy_uj");
+}
+
+static int
+open_powercap_pkg0_dram_energy(void)
+{
+        for (int i = 0;; i++) {
+                int     fd;
+                char    *path, name[64];
+
+                asprintf(&path, "/sys/class/powercap/intel-rapl:0:%d/name", i);
+                fd = open_powercap(path);
+                read(fd, name, sizeof name);
+                free(path);
+                if (strncmp(name, "dram", 4) == 0) {
+                        asprintf(&path, "/sys/class/powercap/intel-rapl:0:%d/energy_uj", i);
+                        fd = open_powercap(path);
+                        free(path);
+                        return fd;
+                }
+        }
+}
+
 static double
-read_energy_cpu(int fd)
+read_powercap_energy(int fd)
 {
         unsigned long energy_uj;
         char buf[128];
@@ -71,6 +101,16 @@ read_energy_cpu(int fd)
         }
         energy_uj = strtoul(buf, NULL, 10);
         return (double)energy_uj / 1e6;
+}
+
+static void
+read_powercap_power_energy(int fd, double *p_power, double *p_energy, double *p_acc_energy_last)
+{
+        double  acc_energy_cur = read_powercap_energy(fd);
+
+        *p_energy = acc_energy_cur - *p_acc_energy_last;
+        *p_power = *p_energy / (interval / 1000000);
+        *p_acc_energy_last = acc_energy_cur;
 }
 
 static inline uint64_t
@@ -207,6 +247,12 @@ print_headers(void)
         printf(" HH:MM:ss CPU(W)");
         if (has_energy)
                 printf(" CPU(J)");
+        if (has_dram) {
+                printf(" DRAM(W)");
+                if (has_energy)
+                        printf(" DRAM(J)");
+        }
+                
 #ifndef NO_NVML
         if (use_gpu) {
                 printf(" GPU(W)");
@@ -225,11 +271,11 @@ print_headers(void)
 }
 
 static void
-log_energy(int fd)
+log_energy(int fd_cpu, int fd_cpu_dram)
 {
         char    timebuf[32];
         struct timespec ts_start, ts_next;
-        double  energy_last;
+        double  acc_energy_last_cpu, acc_energy_last_cpu_dram;
 
         wait_until_aligned_interval();
 
@@ -237,7 +283,9 @@ log_energy(int fd)
 
         clock_gettime(CLOCK_MONOTONIC, &ts_start);
         ts_next = ts_start;
-        energy_last = read_energy_cpu(fd);
+        acc_energy_last_cpu = read_powercap_energy(fd_cpu);
+        if (fd_cpu_dram >= 0)
+                acc_energy_last_cpu_dram = read_powercap_energy(fd_cpu_dram);
 #ifndef NO_NVML
         read_energy_gpu();
         gpu_powers_last = gpu_powers;
@@ -255,14 +303,20 @@ log_energy(int fd)
                 }
                 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts_next, NULL);
 
-                double  energy_cur = read_energy_cpu(fd);
-                double  energy = energy_cur - energy_last;
-                double  power = energy / (interval / 1000000);
+                double  energy_cpu, power_cpu, energy_cpu_dram, power_cpu_dram;
+                read_powercap_power_energy(fd_cpu, &power_cpu, &energy_cpu, &acc_energy_last_cpu);
+                if (fd_cpu_dram >= 0)
+                        read_powercap_power_energy(fd_cpu_dram, &power_cpu_dram, &energy_cpu_dram, &acc_energy_last_cpu_dram);
                 setup_current_time_str(timebuf);
 
-                printf("%s %.3f", timebuf, power);
+                printf("%s %.3f", timebuf, power_cpu);
                 if (has_energy)
-                        printf(" %.3f", energy);
+                        printf(" %.3f", energy_cpu);
+                if (fd_cpu_dram >= 0) {
+                        printf(" %.3f", power_cpu_dram);
+                        if (has_energy)
+                                printf(" %.3f", energy_cpu_dram);
+                }
 #ifndef NO_NVML
                 if (use_gpu) {
                         double  total_power, total_energy;
@@ -287,7 +341,6 @@ log_energy(int fd)
 #endif
                 printf("\n");
                 fflush(stdout);
-                energy_last = energy_cur;
         }
 }
 
@@ -296,7 +349,7 @@ parse_args(int argc, char *argv[])
 {
         int     c;
 
-        while ((c = getopt(argc, argv, "i:t:DEHhgG")) != -1) {
+        while ((c = getopt(argc, argv, "i:t:dDEHhgG")) != -1) {
                 switch (c) {
                         case 'i':
                                 interval = strtoul(optarg, NULL, 10) * 1000000;
@@ -307,6 +360,9 @@ parse_args(int argc, char *argv[])
                                         fprintf(stderr, "Invalid timeout value: %s\n", optarg);
                                         exit(EXIT_FAILURE);
                                 }
+                                break;
+                        case 'd':
+                                has_dram = 1;
                                 break;
                         case 'D':
                                 has_mmdd = 1;
@@ -339,7 +395,7 @@ parse_args(int argc, char *argv[])
 int
 main(int argc, char *argv[])
 {       
-        int     fd;
+        int     fd_cpu, fd_cpu_dram = -1;
 
         parse_args(argc, argv);
 
@@ -349,9 +405,13 @@ main(int argc, char *argv[])
         }
 #endif
 
-        fd = open_powercap();
-        log_energy(fd);
-        close(fd);
+        fd_cpu = open_powercap_pkg0_energy();
+        if (has_dram)
+                fd_cpu_dram = open_powercap_pkg0_dram_energy();
+        log_energy(fd_cpu, fd_cpu_dram);
+        close(fd_cpu);
+        if (fd_cpu_dram >= 0)
+                close(fd_cpu_dram);
 
 #ifndef NO_NVML
         if (use_gpu) {
